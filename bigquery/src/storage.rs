@@ -1,18 +1,22 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, Cursor};
 
 use arrow::error::ArrowError;
 use arrow::ipc::reader::StreamReader;
 pub use arrow::*;
 
-use google_cloud_gax::grpc::{Status, Streaming};
+use google_cloud_gax::grpc::{Request, Response, Status, Streaming};
 use google_cloud_gax::retry::RetrySetting;
 use google_cloud_googleapis::cloud::bigquery::storage::v1::read_rows_response::{Rows, Schema};
+use google_cloud_googleapis::cloud::bigquery::storage::v1::append_rows_request::Rows as AppendRowsRequestRows;
+use google_cloud_googleapis::cloud::bigquery::storage::v1::write_stream::{Type, WriteMode};
 use google_cloud_googleapis::cloud::bigquery::storage::v1::{
-    ArrowSchema, ReadRowsRequest, ReadRowsResponse, ReadSession,
+    AppendRowsRequest, AppendRowsResponse, ArrowSchema, BatchCommitWriteStreamsRequest, BatchCommitWriteStreamsResponse, CreateWriteStreamRequest, FinalizeWriteStreamRequest, FinalizeWriteStreamResponse, FlushRowsRequest, FlushRowsResponse, GetWriteStreamRequest, ReadRowsRequest, ReadRowsResponse, ReadSession, TableSchema, WriteStream, WriteStreamView
 };
+use uuid::Uuid;
 
-use crate::grpc::apiv1::bigquery_client::StreamingReadClient;
+use crate::grpc::apiv1::bigquery_client::{StreamingReadClient, StreamingWriteClient};
+use crate::http::table::TableReference;
 use crate::storage::value::StructDecodable;
 
 #[derive(thiserror::Error, Debug)]
@@ -135,6 +139,106 @@ where
         }
         _ => Err(Error::InvalidDataFormat),
     }
+}
+
+pub struct Writer{
+    client: StreamingWriteClient,
+    table: TableReference,
+    write_type: Type,
+    table_schema: TableSchema,
+    location: String,
+    retry: Option<RetrySetting>,
+}
+
+impl Writer {
+    pub fn new(client: StreamingWriteClient,
+        table: TableReference,
+        write_type: Type,
+        table_schema: TableSchema,
+        location: String,
+        retry: Option<RetrySetting>
+    ) -> Self{
+        Self{
+            client,
+            table,
+            write_type,
+            table_schema,
+            location,
+            retry,
+        }
+    }
+    #[cfg_attr(feature = "trace", tracing::instrument(skip_all))]
+    pub async fn create_write_stream(
+        &mut self,
+        stream_name:String
+    ) -> Result<Response<WriteStream>, Status> {
+        let request = self.build_create_write_stream_request(stream_name);
+        self.client.create_write_stream(request, self.retry.clone()).await
+    }
+
+    #[cfg_attr(feature = "trace", tracing::instrument(skip_all))]
+    pub async fn append_rows(
+        &mut self,
+        rows: Vec<AppendRowsRequestRows>,
+        write_stream: String,
+    ) -> Result<Response<Streaming<AppendRowsResponse>>, Status> {
+        let trace_id =  Uuid::new_v4().hyphenated().to_string();
+        let append_req:Vec<AppendRowsRequest> = rows.into_iter().map(|row| AppendRowsRequest{ write_stream: write_stream.clone(), offset:None, trace_id: trace_id.clone(), missing_value_interpretations: HashMap::default(), rows: Some(row)}).collect();
+        self.client.append_rows(Request::new(tokio_stream::iter(append_req))).await
+    }
+    
+    #[cfg_attr(feature = "trace", tracing::instrument(skip_all))]
+    pub async fn get_write_stream(
+        &mut self,
+        write_stream:String,
+    ) -> Result<Response<WriteStream>, Status> {
+        let req = GetWriteStreamRequest{ name: write_stream
+        , view: WriteStreamView::Basic.into() };
+        self.client.get_write_stream(req, self.retry.clone()).await
+    }
+
+    #[cfg_attr(feature = "trace", tracing::instrument(skip_all))]
+    pub async fn finalize_write_stream(
+        &mut self,
+        write_stream:String,
+    ) -> Result<Response<FinalizeWriteStreamResponse>, Status> {
+        let req = FinalizeWriteStreamRequest{ name: write_stream };
+        self.client.finalize_write_stream(req, self.retry.clone()).await
+    }
+
+    #[cfg_attr(feature = "trace", tracing::instrument(skip_all))]
+    pub async fn batch_commit_write_streams(
+        &mut self,
+        write_streams:Vec<String>,
+    ) -> Result<Response<BatchCommitWriteStreamsResponse>, Status> {
+        let req = BatchCommitWriteStreamsRequest{ parent: format!("projects/{}/datasets/{}/tables/{}", self.table.project_id, self.table.dataset_id, self.table.table_id), write_streams };
+        self.client.batch_commit_write_streams(req, self.retry.clone()).await
+    }
+
+    #[cfg_attr(feature = "trace", tracing::instrument(skip_all))]
+    pub async fn flush_rows(
+        &mut self,
+        write_stream: String,
+    ) -> Result<Response<FlushRowsResponse>, Status> {
+        let req = FlushRowsRequest{ write_stream, offset: None };
+        self.client.flush_rows(req, self.retry.clone()).await
+    }
+
+    fn build_create_write_stream_request(&self,stream_name:String) -> CreateWriteStreamRequest{
+        CreateWriteStreamRequest{
+            parent: format!("projects/{}/datasets/{}/tables/{}", self.table.project_id, self.table.dataset_id, self.table.table_id),
+            write_stream: Some(WriteStream{
+                name: format!("projects/{}/datasets/{}/tables/{}/streams/{}", self.table.project_id, self.table.dataset_id, self.table.table_id,stream_name),
+                r#type: self.write_type.into(),
+                create_time: None,
+                commit_time: None,
+                table_schema: Some(self.table_schema.clone()),
+                write_mode: WriteMode::Unspecified.into(),
+                location: self.location.clone(),
+            })
+        }
+    }
+
 }
 
 pub mod row {

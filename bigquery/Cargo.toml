@@ -15,6 +15,7 @@ async-trait = "0.1"
 google-cloud-token = { version = "0.1.1", path = "../foundation/token" }
 google-cloud-googleapis = { version="0.12.0", path = "../googleapis", features=["bigquery"]}
 google-cloud-gax = { version = "0.17.0", path = "../foundation/gax"}
+uuid = { version="1.4", features=["v4"] }
 thiserror = "1.0"
 tracing = "0.1"
 reqwest = { version = "0.11", features = ["json", "stream", "multipart"], default-features = false }
@@ -28,7 +29,10 @@ bigdecimal = { version="0.4", features=["serde"] }
 num-bigint = "0.4"
 backon = "0.4"
 reqwest-middleware = "0.2"
+protobuf = "3.4"
+prost-types = "0.12.3"
 anyhow = "1.0"
+tokio-stream = "0.1.14"
 
 google-cloud-auth = { optional = true, version = "0.13", path="../foundation/auth", default-features=false }
 

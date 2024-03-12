@@ -1,4 +1,5 @@
 use backon::{ExponentialBuilder, Retryable};
+use google_cloud_googleapis::cloud::bigquery::storage::v1::write_stream::Type;
 use core::time::Duration;
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -8,10 +9,11 @@ use std::sync::Arc;
 use google_cloud_gax::conn::{ConnectionOptions, Environment};
 use google_cloud_gax::retry::RetrySetting;
 use google_cloud_googleapis::cloud::bigquery::storage::v1::{
-    read_session, CreateReadSessionRequest, DataFormat, ReadSession,
+    read_session, CreateReadSessionRequest, DataFormat, ReadSession, TableSchema,
 };
 use google_cloud_token::TokenSourceProvider;
 
+use crate::grpc::apiv1::bigquery_client::StreamingWriteClient;
 use crate::grpc::apiv1::conn_pool::{ReadConnectionManager, DOMAIN};
 use crate::http::bigquery_client::BigqueryClient;
 use crate::http::bigquery_dataset_client::BigqueryDatasetClient;
@@ -26,8 +28,9 @@ use crate::http::job::query::QueryRequest;
 use crate::http::job::{is_script, is_select_query, JobConfiguration, JobReference, JobStatistics, JobType};
 use crate::http::table::TableReference;
 use crate::query::{QueryOption, QueryResult};
-use crate::storage;
+use crate::storage::{self, Writer};
 use crate::{http, query};
+use crate::grpc::apiv1::conn_pool::WriteConnectionManager;
 
 const JOB_RETRY_REASONS: [&str; 3] = ["backendError", "rateLimitExceeded", "internalError"];
 
@@ -170,6 +173,7 @@ pub struct Client {
     row_access_policy_client: BigqueryRowAccessPolicyClient,
     model_client: BigqueryModelClient,
     streaming_read_client_conn_pool: Arc<ReadConnectionManager>,
+    streaming_write_client_conn_pool: Arc<WriteConnectionManager>,
 }
 
 impl Client {
@@ -191,6 +195,7 @@ impl Client {
 
         let streaming_read_client_conn_pool =
             ReadConnectionManager::new(read_config.num_channels, &config.environment, DOMAIN, &conn_options).await?;
+        let streaming_write_client_conn_pool= WriteConnectionManager::new(read_config.num_channels, &config.environment, DOMAIN, &conn_options).await?;
         Ok(Self {
             dataset_client: BigqueryDatasetClient::new(client.clone()),
             table_client: BigqueryTableClient::new(client.clone()),
@@ -200,6 +205,7 @@ impl Client {
             row_access_policy_client: BigqueryRowAccessPolicyClient::new(client.clone()),
             model_client: BigqueryModelClient::new(client.clone()),
             streaming_read_client_conn_pool: Arc::new(streaming_read_client_conn_pool),
+            streaming_write_client_conn_pool: Arc::new(streaming_write_client_conn_pool),
         })
     }
 
@@ -507,6 +513,16 @@ impl Client {
             .into_inner();
         storage::Iterator::new(client, read_session, option.read_rows_retry_setting).await
     }
+
+    pub fn writer_for_table(&self, table: TableReference,
+        write_type: Type,
+        table_schema: TableSchema,
+        location: String,
+        retry: Option<RetrySetting>
+    ) -> Writer {
+        let client = self.streaming_write_client_conn_pool.conn();
+        Writer::new(client, table, write_type, table_schema, location, retry)
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -548,6 +564,11 @@ impl ReadTableOption {
 #[cfg(test)]
 mod tests {
     use bigdecimal::BigDecimal;
+    use google_cloud_auth::credentials::CredentialsFile;
+    use google_cloud_gax::retry::RetrySetting;
+    use google_cloud_googleapis::cloud::bigquery::storage::v1::write_stream::Type;
+    use google_cloud_googleapis::cloud::bigquery::storage::v1::{table_field_schema, ProtoRows, ProtoSchema, TableFieldSchema, TableSchema};
+    use prost_types::{field_descriptor_proto, DescriptorProto, FieldDescriptorProto};
     use serial_test::serial;
     use std::ops::AddAssign;
     use std::time::Duration;
@@ -559,10 +580,11 @@ mod tests {
     use crate::client::{Client, ClientConfig, ReadTableOption};
     use crate::http::bigquery_client::test::{create_table_schema, dataset_name, TestData};
     use crate::http::job::query::QueryRequest;
-    use crate::http::table::{Table, TableReference};
+    use crate::http::table::{Table, TableFieldType, TableReference};
     use crate::http::tabledata::insert_all::{InsertAllRequest, Row};
     use crate::query;
     use crate::query::QueryOption;
+    use google_cloud_googleapis::cloud::bigquery::storage::v1::append_rows_request::{ProtoData, Rows as AppendRowsRequestRows};
 
     #[ctor::ctor]
     fn init() {
@@ -579,6 +601,103 @@ mod tests {
     async fn test_query_from_storage() {
         let option = QueryOption::default().with_enable_storage_read(true);
         test_query(option).await
+    }
+
+    #[tokio::test]
+    async fn test_writer() {
+        let credentials = CredentialsFile::new_from_file("/home/xxhx/Downloads/winter-dynamics-383822-cbec26f21d33.json".to_string()).await.unwrap();
+        let config = ClientConfig::new_with_credentials(credentials).await.unwrap().0;
+        // table: TableReference,
+        // write_type: Type,
+        // table_schema: TableSchema,
+        // location: String,
+        // retry: Option<RetrySetting>winter-dynamics-383822.test_bigquery_sink.t5
+        let table = TableReference{
+            project_id: "winter-dynamics-383822".to_string(),
+            dataset_id: "test_bigquery_sink".to_string(),
+            table_id: "t3".to_string()
+        };
+        let table_schema = TableSchema{
+            fields:vec![TableFieldSchema {
+                name: "v1".to_string(),
+                r#type: table_field_schema::Type::Int64.into(),
+                ..Default::default()
+            },
+            TableFieldSchema {
+                name: "v2".to_string(),
+                r#type: table_field_schema::Type::Int64.into(),
+                ..Default::default()
+            },
+            TableFieldSchema {
+                name: "v3".to_string(),
+                r#type: table_field_schema::Type::Int64.into(),
+                ..Default::default()
+            },
+            TableFieldSchema {
+                name: "_CHANGE_TYPE".to_string(),
+                r#type: table_field_schema::Type::String.into(),
+                ..Default::default()
+            }
+            ]
+        };
+        let mut writer = Client::new(config).await.unwrap().writer_for_table(table,Type::Committed,table_schema,"asia-southeast1".to_string(),Some(RetrySetting::default()));
+        let a = writer.create_write_stream("aaa".to_string()).await.unwrap().into_inner();
+        println!("{:?}",a);
+
+        let mut field1 = FieldDescriptorProto::default();
+        field1.name = Some("v1".to_string());
+        field1.number = Some(2);
+        field1.r#type =Some(field_descriptor_proto::Type::Int64.into()); 
+
+        let mut field2 = FieldDescriptorProto::default();
+        field2.name = Some("v2".to_string());
+        field2.number = Some(3);
+        field2.r#type = Some(field_descriptor_proto::Type::Int64.into()); 
+
+        let mut field3 = FieldDescriptorProto::default();
+        field3.name = Some("v3".to_string());
+        field3.number = Some(4);
+        field3.r#type = Some(field_descriptor_proto::Type::Int64.into()); 
+
+        let mut field4 = FieldDescriptorProto::default();
+        field4.name = Some("_CHANGE_TYPE".to_string());
+        field4.number = Some(5);
+        field4.r#type = Some(field_descriptor_proto::Type::String.into()); 
+
+        let mut descriptor = DescriptorProto::default();
+        descriptor.name = Some("t3".to_string());
+        descriptor.field.push(field1);
+        descriptor.field.push(field2);
+        descriptor.field.push(field3);
+        descriptor.field.push(field4);
+
+        let mut proto_rows =vec![];
+        let mut buf = Vec::new();
+        protobuf::CodedOutputStream::vec(&mut buf).write_int32(2, 1).unwrap();
+        protobuf::CodedOutputStream::vec(&mut buf).write_int32(3, 2).unwrap();
+        protobuf::CodedOutputStream::vec(&mut buf).write_int32(4, 3).unwrap();
+        protobuf::CodedOutputStream::vec(&mut buf).write_string(5, "DELETE").unwrap();
+        proto_rows.push(buf);
+        let mut buf = Vec::new();
+        protobuf::CodedOutputStream::vec(&mut buf).write_int32(2, 21).unwrap();
+        protobuf::CodedOutputStream::vec(&mut buf).write_int32(3, 22).unwrap();
+        protobuf::CodedOutputStream::vec(&mut buf).write_int32(4, 23).unwrap();
+        protobuf::CodedOutputStream::vec(&mut buf).write_string(5, "DELETE").unwrap();
+        proto_rows.push(buf);
+        let pp = ProtoRows{
+            serialized_rows:proto_rows
+        };
+        let schema = ProtoSchema{proto_descriptor:Some(descriptor)};
+
+        let rows = AppendRowsRequestRows::ProtoRows(ProtoData { writer_schema: Some(schema), rows: Some(pp) });
+        let b = writer.append_rows(vec![rows],a.name.clone()).await.unwrap();
+        println!("{:?}",b);
+        for i in b.into_inner().message().await.unwrap(){
+            println!("saed{:?}",i);
+        }
+        // for i in b.into_inner().
+        let b = writer.finalize_write_stream(a.name).await.unwrap();
+        println!("{:?}",b);
     }
 
     #[tokio::test]
